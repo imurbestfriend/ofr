@@ -1,0 +1,26 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Generated output
+output.txt
+combined.txt
+stderr.txt
+analysis.xlsx
+analysis_debug.zip
+*.zip
+*.xlsx
+
+# macOS
+.DS_Store
+
+# Large example files (add manually if needed)
+examples/
+excel_examples/

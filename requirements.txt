@@ -1,0 +1,7 @@
+# System dependency (install via brew): brew install poppler
+# Provides: pdftotext, pdfinfo, pdftoppm
+
+openai==2.21.0
+pdf2image==1.17.0
+python-dotenv==1.2.2
+openpyxl>=3.1
