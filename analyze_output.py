@@ -15,6 +15,36 @@ load_dotenv()
 
 client = OpenAI()
 
+IFRS_PROMPT = """\
+Ты — экстрактор финансовой отчётности. Извлеки из текста строки финансовых форм МСФО: \
+отчёт о финансовом положении (баланс), отчёт о прибылях и убытках, отчёт о движении \
+денежных средств. Верни ТОЛЬКО валидный JSON:
+
+{
+  "statements": [
+    {
+      "type": "название формы (например: Отчёт о финансовом положении)",
+      "items": [
+        {
+          "section": "раздел (например: АКТИВЫ / ОБЯЗАТЕЛЬСТВА / КАПИТАЛ / Выручка и т.п.)",
+          "is_total": true/false,
+          "name": "название строки дословно из текста",
+          "periods": [
+            {"period": "период (например: 2025 / 2024 / 1П2025)", "value": "значение дословно из текста или null"}
+          ]
+        }
+      ]
+    }
+  ]
+}
+
+ПРАВИЛА:
+- Включай ВСЕ строки форм, включая итоговые (is_total: true для строк "Итого...", "Всего...")
+- Значения копируй дословно, включая знак минус если есть
+- Если форма в тексте отсутствует — верни пустой список statements: []
+- Только JSON, без markdown
+"""
+
 CONCLUSION_PROMPT = """\
 Ты — финансовый аналитик. На основе приведённого списка рисков напиши краткий итоговый вывод \
 (2–3 предложения) в следующем формате: сначала сильные стороны (факторы, снижающие риск), \
@@ -29,32 +59,6 @@ SEVERITY_COLORS = {
 
 CHUNK_SIZE = 80_000  # chars per API call
 
-CF_METRICS_NAMES = [
-    "Выручка LTM",
-    "EBITDA LTM",
-    "Рентабельность по EBITDA LTM",
-    "Чистая прибыль LTM",
-    "Долг/EBITDA",
-    "ICR LTM",
-    "ISCR LTM",
-    "DSCR с долгом LTM",
-    "Операционный поток (CFO)",
-    "Инвестиционный поток (CFI)",
-    "Кап. затраты (CAPEX)",
-    "Финансовый поток (CFF)",
-    "Погашение долга",
-    "Привлечение долга",
-    "Чистый денежный поток (NCF)",
-    "Денежные средства",
-    "Долг",
-    "Долг перед Сбером",
-]
-
-CF_CONCLUSION_PROMPT = """\
-Ты — финансовый аналитик. На основе приведённых финансовых метрик напиши краткий вывод \
-(2–3 предложения) о финансовом состоянии компании: ключевые сильные стороны и основные риски. \
-Пиши одним связным абзацем, без заголовков и маркеров.\
-"""
 
 SYSTEM_PROMPT = """\
 Ты — экстрактор данных. Твоя единственная задача — найти и дословно извлечь информацию из \
@@ -71,11 +75,6 @@ SYSTEM_PROMPT = """\
      "unit": "единица измерения точно как в тексте",
      "quote": "дословная цитата из текста, из которой взята эта метрика (1-2 предложения)"}
   ],
-  "cf_metrics": [
-    {"metric": "одно из 18 фиксированных названий (см. ниже)",
-     "period": "период точно как в тексте (например, 6м2026, 12м2024, 1П2025, FY2024, 2025)",
-     "value": "значение дословно из текста (число или процент)"}
-  ],
   "risks": [
     {"name": "краткое название риска (например: Финансовый риск, Риск концентрации, Валютный риск)",
      "category": "категория риска (рыночный/кредитный/операционный/геополитический/репутационный/правовой/другой)",
@@ -84,14 +83,6 @@ SYSTEM_PROMPT = """\
      "detailed_description": "детальное описание риска — дословно из текста или близко к тексту",
      "mitigation_measures": "меры минимизации риска — дословно из текста; если не указаны — предложи исходя из контекста",
      "source": "extracted — если все ключевые поля (описание, метрики, меры) взяты дословно из текста; generated — если хотя бы одно поле было сформулировано тобой при отсутствии в тексте"}
-  ],
-  "guidance": [
-    {"topic": "тема прогноза",
-     "detail": "дословная или близкая к дословной цитата из текста с цифрами и сроками"}
-  ],
-  "highlights": [
-    {"event": "краткое название события",
-     "detail": "дословная или близкая к дословной цитата из текста"}
   ]
 }
 
@@ -101,11 +92,6 @@ SYSTEM_PROMPT = """\
 - Значения (value) и цитаты (quote) копируй дословно, не округляй и не интерпретируй.
 - Если в фрагменте нет данных для категории — верни пустой список [].
 - Ответ — только JSON, без markdown-обёртки, без пояснений вне JSON.
-
-ПРАВИЛА ДЛЯ cf_metrics (только для этого поля):
-- Все 18 допустимых метрик — исключительно ФИНАНСОВЫЕ показатели (из P&L, Cash Flow Statement, баланса). НЕ путай с операционными/производственными показателями (добыча, запасы, объём реализации в тоннах/куб.м, численность персонала, дивиденды на акцию).
-- Допустимый маппинг: «Выручка LTM» ← выручка от реализации/revenue в руб.; «EBITDA LTM» ← EBITDA; «Рентабельность по EBITDA LTM» ← рентабельность по EBITDA в %; «Чистая прибыль LTM» ← чистая прибыль/прибыль за период в денежных единицах; «Долг/EBITDA» ← коэффициент типа 2.4x; «ICR/ISCR/DSCR с долгом LTM» ← только эти явные коэффициенты; «Операционный поток (CFO)» ← CFO; «Инвестиционный поток (CFI)» ← CFI; «Кап. затраты (CAPEX)» ← капитальные вложения/CAPEX в денежных единицах; «Финансовый поток (CFF)» ← CFF; «Погашение долга», «Привлечение долга» ← явные статьи долга; «Чистый денежный поток (NCF)» ← NCF; «Денежные средства» ← остаток денежных средств; «Долг» ← общий долг/заёмные средства; «Долг перед Сбером» ← только явно.
-- Если явного финансового показателя в тексте нет — НЕ включай запись.
 """
 
 
@@ -125,6 +111,44 @@ def build_chunks(text: str) -> list[str]:
     return chunks
 
 
+def extract_ifrs_chunk(chunk: str, index: int, total: int) -> dict:
+    print(f"  IFRS chunk {index}/{total} ({len(chunk):,} chars)...", file=sys.stderr)
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        temperature=0,
+        messages=[
+            {"role": "system", "content": IFRS_PROMPT},
+            {"role": "user", "content": chunk},
+        ],
+        max_tokens=8192,
+    )
+    raw = response.choices[0].message.content
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        print(f"  Warning: could not parse IFRS JSON from chunk {index}", file=sys.stderr)
+        return {"statements": []}
+
+
+def merge_ifrs_results(results: list[dict]) -> dict:
+    merged_by_type: dict[str, list] = {}
+    for r in results:
+        for stmt in r.get("statements", []):
+            stmt_type = stmt.get("type", "").strip()
+            if not stmt_type:
+                continue
+            if stmt_type not in merged_by_type:
+                merged_by_type[stmt_type] = []
+            seen = {(i.get("section", ""), i.get("name", "")) for i in merged_by_type[stmt_type]}
+            for item in stmt.get("items", []):
+                key = (item.get("section", ""), item.get("name", ""))
+                if key not in seen:
+                    merged_by_type[stmt_type].append(item)
+                    seen.add(key)
+    return {"statements": [{"type": t, "items": items} for t, items in merged_by_type.items()]}
+
+
 def extract_chunk(chunk: str, index: int, total: int) -> dict:
     print(f"  Chunk {index}/{total} ({len(chunk):,} chars)...", file=sys.stderr)
     response = client.chat.completions.create(
@@ -142,13 +166,12 @@ def extract_chunk(chunk: str, index: int, total: int) -> dict:
         return json.loads(raw)
     except json.JSONDecodeError:
         print(f"  Warning: could not parse JSON from chunk {index}", file=sys.stderr)
-        return {"metrics": [], "risks": [], "guidance": [], "highlights": []}
+        return {"metrics": [], "risks": []}
 
 
 def merge_results(results: list[dict]) -> dict:
-    merged = {"metrics": [], "cf_metrics": [], "risks": [], "guidance": [], "highlights": []}
+    merged = {"metrics": [], "risks": []}
     seen_metrics: set[tuple] = set()
-    seen_cf: set[tuple] = set()
     seen_risks: set[tuple] = set()
 
     for r in results:
@@ -158,41 +181,14 @@ def merge_results(results: list[dict]) -> dict:
                 seen_metrics.add(key)
                 merged["metrics"].append(m)
 
-        for item in r.get("cf_metrics", []):
-            key = (item.get("metric", ""), item.get("period", "").lower())
-            if key not in seen_cf:
-                seen_cf.add(key)
-                merged["cf_metrics"].append(item)
-
         for risk in r.get("risks", []):
             key = (risk.get("name", "").lower()[:60], risk.get("category", "").lower())
             if key not in seen_risks:
                 seen_risks.add(key)
                 merged["risks"].append(risk)
 
-        merged["guidance"].extend(r.get("guidance", []))
-        merged["highlights"].extend(r.get("highlights", []))
-
     return merged
 
-
-def generate_cf_conclusion(cf_metrics: list[dict]) -> str:
-    if not cf_metrics:
-        return ""
-    summary = "\n".join(
-        f"- {item.get('metric', '?')} [{item.get('period', '?')}]: {item.get('value', '')}"
-        for item in cf_metrics
-    )
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        temperature=0,
-        messages=[
-            {"role": "system", "content": CF_CONCLUSION_PROMPT},
-            {"role": "user", "content": summary},
-        ],
-        max_tokens=512,
-    )
-    return response.choices[0].message.content.strip()
 
 
 def generate_conclusion(risks: list[dict]) -> str:
@@ -214,35 +210,6 @@ def generate_conclusion(risks: list[dict]) -> str:
     return response.choices[0].message.content.strip()
 
 
-
-def _sort_period(period_str: str) -> tuple:
-    import re
-    s = (period_str or "").strip()
-    # 6м2026 / 12м2025
-    m = re.match(r"^(\d{1,2})м(\d{4})$", s)
-    if m:
-        return (int(m.group(2)), int(m.group(1)))
-    # 1П2025 / 2П2025
-    m = re.match(r"^([12])П(\d{4})$", s, re.IGNORECASE)
-    if m:
-        return (int(m.group(2)), int(m.group(1)) * 6)
-    # 1кв2025 / 4кв2025
-    m = re.match(r"^(\d)кв(\d{4})$", s, re.IGNORECASE)
-    if m:
-        return (int(m.group(2)), int(m.group(1)) * 3)
-    # H1 2025 / H2 2026
-    m = re.match(r"^H([12])\s*(\d{4})$", s, re.IGNORECASE)
-    if m:
-        return (int(m.group(2)), int(m.group(1)) * 6)
-    # FY2024
-    m = re.match(r"^FY(\d{4})$", s, re.IGNORECASE)
-    if m:
-        return (int(m.group(1)), 12)
-    # bare year: 2024
-    m = re.match(r"^(\d{4})$", s)
-    if m:
-        return (int(m.group(1)), 12)
-    return (9999, 99)
 
 
 def style_header(ws, row=1):
@@ -267,7 +234,116 @@ def auto_width(ws):
         ws.column_dimensions[col_letter].width = min(max_len + 4, 60)
 
 
-def write_excel(data: dict, out_path: str, conclusion: str = "", cf_conclusion: str = "") -> None:
+def write_ifrs_sheet(wb, ifrs_data: dict) -> None:
+    statements = ifrs_data.get("statements", [])
+    if not statements:
+        return
+
+    ws = wb.create_sheet("МСФО")
+
+    thin = Side(style="thin", color="BFBFBF")
+    cell_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # Collect all unique periods across all statements
+    all_periods: list[str] = []
+    for stmt in statements:
+        for item in stmt.get("items", []):
+            for p in item.get("periods", []):
+                period = p.get("period", "")
+                if period and period not in all_periods:
+                    all_periods.append(period)
+
+    current_row = 1
+
+    for stmt in statements:
+        stmt_type = stmt.get("type", "Форма")
+        items = stmt.get("items", [])
+        if not items:
+            continue
+
+        # Statement title row
+        title_end_col = 2 + len(all_periods) - 1
+        ws.merge_cells(start_row=current_row, start_column=1,
+                       end_row=current_row, end_column=max(title_end_col, 2))
+        title_cell = ws.cell(row=current_row, column=1, value=stmt_type.upper())
+        title_cell.fill = PatternFill("solid", fgColor="1F4E79")
+        title_cell.font = Font(bold=True, color="FFFFFF", size=12)
+        title_cell.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[current_row].height = 20
+        current_row += 1
+
+        # Header row: "Статья" + periods
+        ws.cell(row=current_row, column=1, value="Статья").fill = PatternFill("solid", fgColor="BDD7EE")
+        ws.cell(row=current_row, column=1).font = Font(bold=True, color="1F3864", size=10)
+        ws.cell(row=current_row, column=1).border = cell_border
+        ws.cell(row=current_row, column=1).alignment = Alignment(horizontal="left", vertical="center")
+        for col_offset, period in enumerate(all_periods, start=2):
+            cell = ws.cell(row=current_row, column=col_offset, value=period)
+            cell.fill = PatternFill("solid", fgColor="BDD7EE")
+            cell.font = Font(bold=True, color="1F3864", size=10)
+            cell.alignment = Alignment(horizontal="right", vertical="center")
+            cell.border = cell_border
+        ws.row_dimensions[current_row].height = 18
+        current_row += 1
+
+        current_section = None
+        for item in items:
+            section = item.get("section", "")
+            is_total = item.get("is_total", False)
+            name = item.get("name", "")
+            periods_data = {p.get("period", ""): p.get("value") for p in item.get("periods", [])}
+
+            # Section header when section changes
+            if section and section != current_section:
+                current_section = section
+                sec_end_col = 2 + len(all_periods) - 1
+                ws.merge_cells(start_row=current_row, start_column=1,
+                               end_row=current_row, end_column=max(sec_end_col, 2))
+                sec_cell = ws.cell(row=current_row, column=1, value=section)
+                sec_cell.fill = PatternFill("solid", fgColor="D6E4F0")
+                sec_cell.font = Font(bold=True, color="1F3864", size=10)
+                sec_cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+                sec_cell.border = cell_border
+                ws.row_dimensions[current_row].height = 16
+                current_row += 1
+
+            # Data row
+            name_cell = ws.cell(row=current_row, column=1, value=name)
+            name_cell.alignment = Alignment(horizontal="left", vertical="center",
+                                            indent=(1 if not is_total else 0), wrap_text=True)
+            name_cell.border = cell_border
+            if is_total:
+                name_cell.font = Font(bold=True, size=10)
+                name_cell.fill = PatternFill("solid", fgColor="EBF3FB")
+            else:
+                name_cell.font = Font(size=10)
+
+            for col_offset, period in enumerate(all_periods, start=2):
+                val = periods_data.get(period)
+                val_cell = ws.cell(row=current_row, column=col_offset, value=val)
+                val_cell.alignment = Alignment(horizontal="right", vertical="center")
+                val_cell.border = cell_border
+                if is_total:
+                    val_cell.font = Font(bold=True, size=10)
+                    val_cell.fill = PatternFill("solid", fgColor="EBF3FB")
+                else:
+                    val_cell.font = Font(size=10)
+
+            current_row += 1
+
+        # Spacer between statements
+        current_row += 1
+
+    # Column widths
+    ws.column_dimensions["A"].width = 52
+    for col_offset in range(len(all_periods)):
+        col_letter = get_column_letter(2 + col_offset)
+        ws.column_dimensions[col_letter].width = 18
+
+    ws.freeze_panes = "B3"
+
+
+def write_excel(data: dict, out_path: str, conclusion: str = "", ifrs_data: dict | None = None) -> None:
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 
@@ -357,100 +433,12 @@ def write_excel(data: dict, out_path: str, conclusion: str = "", cf_conclusion: 
         cell.border = cell_border
         ws.row_dimensions[conclusion_row].height = 70
 
-    # --- CF-модель sheet ---
-    ws = wb.create_sheet("CF-модель")
-
-    thin = Side(style="thin", color="BFBFBF")
-    cf_border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    navy_fill = PatternFill("solid", fgColor="1F4E79")
-    navy_font = Font(bold=True, color="FFFFFF", size=11)
-    name_fill = PatternFill("solid", fgColor="F2F2F2")
-    row_fills = [PatternFill("solid", fgColor="FFFFFF"), PatternFill("solid", fgColor="F5F5F5")]
-
-    # Build pivot: metric → period → value
-    cf_data: dict[str, dict[str, str]] = {m: {} for m in CF_METRICS_NAMES}
-    for item in data.get("cf_metrics", []):
-        metric = item.get("metric", "")
-        period = item.get("period", "")
-        value = item.get("value", "")
-        if metric in cf_data and period:
-            cf_data[metric][period] = value
-
-    # Collect and sort periods
-    all_periods = sorted(
-        {p for vals in cf_data.values() for p in vals},
-        key=_sort_period,
-    )
-
-    # Column widths
-    ws.column_dimensions["A"].width = 30
-    for col_idx in range(2, len(all_periods) + 2):
-        ws.column_dimensions[get_column_letter(col_idx)].width = 14
-
-    # Header row
-    ws.cell(row=1, column=1, value="Показатели").fill = navy_fill
-    ws.cell(row=1, column=1).font = navy_font
-    ws.cell(row=1, column=1).alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.cell(row=1, column=1).border = cf_border
-    for col_idx, period in enumerate(all_periods, 2):
-        cell = ws.cell(row=1, column=col_idx, value=period)
-        cell.fill = navy_fill
-        cell.font = navy_font
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = cf_border
-    ws.row_dimensions[1].height = 22
-    ws.freeze_panes = "B2"
-
-    # Data rows
-    for row_idx, metric in enumerate(CF_METRICS_NAMES, 2):
-        alt_fill = row_fills[(row_idx) % 2]
-        name_cell = ws.cell(row=row_idx, column=1, value=metric)
-        name_cell.font = Font(bold=True, size=10)
-        name_cell.fill = name_fill
-        name_cell.alignment = Alignment(vertical="center", wrap_text=True)
-        name_cell.border = cf_border
-
-        for col_idx, period in enumerate(all_periods, 2):
-            val = cf_data[metric].get(period, "")
-            cell = ws.cell(row=row_idx, column=col_idx, value=val)
-            cell.fill = alt_fill
-            cell.alignment = Alignment(horizontal="right", vertical="center")
-            cell.border = cf_border
-        ws.row_dimensions[row_idx].height = 18
-
-    # Вывод row
-    if cf_conclusion:
-        last_col = max(len(all_periods) + 1, 1)
-        vyvod_row = len(CF_METRICS_NAMES) + 2
-        ws.merge_cells(start_row=vyvod_row, start_column=1, end_row=vyvod_row, end_column=last_col)
-        cell = ws.cell(row=vyvod_row, column=1, value=f"ВЫВОД: {cf_conclusion}")
-        cell.fill = navy_fill
-        cell.font = navy_font
-        cell.alignment = Alignment(wrap_text=True, vertical="top", horizontal="left")
-        cell.border = cf_border
-        ws.row_dimensions[vyvod_row].height = 60
-
-    # --- Guidance sheet ---
-    ws = wb.create_sheet("Прогнозы Guidance")
-    ws.append(["Тема", "Детали"])
-    for g in data["guidance"]:
-        ws.append([g.get("topic"), g.get("detail")])
-    style_header(ws)
-    ws.freeze_panes = "A2"
-    auto_width(ws)
-
-    # --- Highlights sheet ---
-    ws = wb.create_sheet("События Highlights")
-    ws.append(["Событие", "Детали"])
-    for h in data["highlights"]:
-        ws.append([h.get("event"), h.get("detail")])
-    style_header(ws)
-    ws.freeze_panes = "A2"
-    auto_width(ws)
+    if ifrs_data:
+        write_ifrs_sheet(wb, ifrs_data)
 
     # Wrap long cells (risks sheet handles alignment per cell)
     for sheet in wb.sheetnames:
-        if sheet == "Риски":
+        if sheet in ("Риски", "МСФО"):
             continue
         for row in wb[sheet].iter_rows(min_row=2):
             for cell in row:
@@ -489,16 +477,29 @@ def main():
 
     data = merge_results(results)
     print(
-        f"Extracted: {len(data['metrics'])} metrics, {len(data['cf_metrics'])} cf_metrics, "
-        f"{len(data['risks'])} risks, {len(data['guidance'])} guidance, {len(data['highlights'])} highlights",
+        f"Extracted: {len(data['metrics'])} metrics, {len(data['risks'])} risks",
         file=sys.stderr,
     )
 
     print("Generating conclusion...", file=sys.stderr)
     conclusion = generate_conclusion(data["risks"])
-    cf_conclusion = generate_cf_conclusion(data["cf_metrics"])
 
-    write_excel(data, args.out, conclusion=conclusion, cf_conclusion=cf_conclusion)
+    print("Extracting IFRS financial statements...", file=sys.stderr)
+    ifrs_results: list[dict] = [None] * len(chunks)
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {
+            pool.submit(extract_ifrs_chunk, chunk, i + 1, len(chunks)): i
+            for i, chunk in enumerate(chunks)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            ifrs_results[idx] = future.result()
+
+    ifrs_data = merge_ifrs_results(ifrs_results)
+    stmt_count = len(ifrs_data.get("statements", []))
+    print(f"Extracted: {stmt_count} IFRS statement(s)", file=sys.stderr)
+
+    write_excel(data, args.out, conclusion=conclusion, ifrs_data=ifrs_data)
     print(f"Saved: {args.out}", file=sys.stderr)
 
 
