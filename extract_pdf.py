@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import base64
 import io
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -8,10 +9,14 @@ from pathlib import Path
 from openai import OpenAI
 from pdf2image import convert_from_path
 from dotenv import load_dotenv
+from llm_config import get_base_url, get_completion_options, get_model
 
 load_dotenv()
 
-client = OpenAI()
+client = OpenAI(
+    api_key=os.environ["OCTAVA_API_KEY"],
+    base_url=get_base_url(),
+)
 
 MAX_CHARS = 400_000
 
@@ -73,7 +78,7 @@ def ocr_with_gpt(pdf_path: str, page_num: int) -> str:
     image_b64 = base64.b64encode(buf.getvalue()).decode()
 
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model=get_model(),
         messages=[
             {
                 "role": "user",
@@ -89,7 +94,7 @@ def ocr_with_gpt(pdf_path: str, page_num: int) -> str:
                 ],
             }
         ],
-        max_tokens=4096,
+        **get_completion_options(),
     )
     text = response.choices[0].message.content
     # Strip markdown code fences GPT sometimes wraps output in
@@ -111,7 +116,7 @@ def extract_pdf(pdf_path: str) -> str:
             print(f"  [{page_num}/{page_count}] embedded text ({len(text)} chars)", file=sys.stderr)
             pages.append(text)
         else:
-            print(f"  [{page_num}/{page_count}] scanned page — calling GPT-4o...", file=sys.stderr)
+            print(f"  [{page_num}/{page_count}] scanned page — calling {get_model()}...", file=sys.stderr)
             text = ocr_with_gpt(pdf_path, page_num)
             print(f"  [{page_num}/{page_count}] OCR done ({len(text)} chars)", file=sys.stderr)
             pages.append(text)

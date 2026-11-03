@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
+import re
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import OpenAI
+from llm_config import build_messages, get_base_url, get_completion_options, get_model
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Side, Border
 from openpyxl.utils import get_column_letter
 
 load_dotenv()
 
-client = OpenAI()
+client = OpenAI(
+    api_key=os.environ["OCTAVA_API_KEY"],
+    base_url=get_base_url(),
+)
 
 IFRS_PROMPT = """\
 Ты — экстрактор финансовой отчётности. Извлеки из текста строки финансовых форм МСФО: \
@@ -57,7 +64,12 @@ SEVERITY_COLORS = {
     "низкий": "70AD47",
 }
 
-CHUNK_SIZE = 80_000  # chars per API call
+CHUNK_SIZE = 20_000  # chars per API call
+CHUNK_SEPARATOR = "\n\n---\n\n"
+MAX_SPLIT_DEPTH = 3
+MIN_SPLIT_CHARS = 2_000
+MAX_OUTPUT_TOKENS = 32_768
+LLM_ERROR_DIR = Path(__file__).resolve().parent / "llm_errors"
 
 
 SYSTEM_PROMPT = """\
@@ -96,39 +108,135 @@ SYSTEM_PROMPT = """\
 
 
 def build_chunks(text: str) -> list[str]:
-    sections = text.split("\n\n---\n\n")
-    chunks, current, current_size = [], [], 0
-    for section in sections:
-        size = len(section) + (8 if current else 0)
-        if current and current_size + size > CHUNK_SIZE:
-            chunks.append("\n\n---\n\n".join(current))
-            current, current_size = [section], len(section)
-        else:
-            current.append(section)
-            current_size += size
-    if current:
-        chunks.append("\n\n---\n\n".join(current))
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + CHUNK_SIZE, len(text))
+        if end < len(text):
+            boundary = text.rfind(CHUNK_SEPARATOR, start + CHUNK_SIZE // 2, end)
+            if boundary >= 0:
+                end = boundary + len(CHUNK_SEPARATOR)
+            else:
+                boundary = text.rfind("\n", start + CHUNK_SIZE // 2, end)
+                if boundary >= 0:
+                    end = boundary + 1
+        chunks.append(text[start:end])
+        start = end
     return chunks
+
+
+def _parse_extraction(raw: str, kind: str) -> dict:
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("Пустой ответ модели")
+    raw = raw.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*\n?(.*?)\n?```", raw, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        raw = fenced.group(1).strip()
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("Ожидался JSON-объект")
+    fields = ("statements",) if kind == "ifrs" else ("metrics", "risks")
+    for field in fields:
+        if not isinstance(data.get(field), list) or any(
+            not isinstance(item, dict) for item in data[field]
+        ):
+            raise ValueError(f"Поле {field} должно быть списком объектов")
+    if kind == "ifrs":
+        for statement in data["statements"]:
+            if not isinstance(statement.get("type"), str) or not statement["type"].strip():
+                raise ValueError("У формы МСФО отсутствует название type")
+            if not isinstance(statement.get("items"), list):
+                raise ValueError("Поле items должно быть списком объектов")
+            for item in statement["items"]:
+                if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                    raise ValueError("Некорректная строка формы МСФО")
+                if not isinstance(item.get("periods"), list) or any(
+                    not isinstance(period, dict) or "period" not in period or "value" not in period
+                    for period in item["periods"]
+                ):
+                    raise ValueError("Некорректные периоды строки МСФО")
+    else:
+        for field, required in (("metrics", ("name", "period", "value")), ("risks", ("name",))):
+            for item in data[field]:
+                if any(not isinstance(item.get(key), str) for key in required):
+                    raise ValueError(f"Некорректные обязательные поля {field}")
+    return data
+
+
+def _save_bad_response(response, kind: str, index: int, error: str) -> Path:
+    choices = getattr(response, "choices", None) or []
+    choice = choices[0] if choices else None
+    message = getattr(choice, "message", None)
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        usage = usage.model_dump() if hasattr(usage, "model_dump") else vars(usage)
+    diagnostic = {
+        "model": get_model(), "kind": kind, "chunk": index, "error": error,
+        "max_tokens": MAX_OUTPUT_TOKENS,
+        "reasoning_effort": get_completion_options().get("reasoning_effort"),
+        "finish_reason": getattr(choice, "finish_reason", None), "usage": usage,
+        "content": getattr(message, "content", None),
+        "refusal": getattr(message, "refusal", None),
+    }
+    LLM_ERROR_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix=f"{kind}-{index}-",
+                                     suffix=".json", dir=LLM_ERROR_DIR, delete=False) as output:
+        json.dump(diagnostic, output, ensure_ascii=False, indent=2, default=vars)
+        return Path(output.name)
+
+
+def _extract_json(chunk: str, index: int, kind: str, depth: int = 0) -> dict:
+    prompt = IFRS_PROMPT if kind == "ifrs" else SYSTEM_PROMPT
+    for attempt in range(2):
+        response = client.chat.completions.create(
+            model=get_model(), response_format={"type": "json_object"},
+            temperature=0, **get_completion_options(MAX_OUTPUT_TOKENS),
+            messages=build_messages(prompt, chunk),
+        )
+        choices = getattr(response, "choices", None) or []
+        choice = choices[0] if choices else None
+        reason = getattr(choice, "finish_reason", None)
+        message = getattr(choice, "message", None)
+        usage = getattr(response, "usage", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        budget_exhausted = (isinstance(completion_tokens, int)
+                            and completion_tokens >= MAX_OUTPUT_TOKENS)
+        try:
+            if reason != "stop":
+                raise ValueError(f"finish_reason={reason}")
+            if getattr(message, "refusal", None):
+                raise ValueError("Модель отказалась обрабатывать фрагмент")
+            if budget_exhausted:
+                raise ValueError(f"Исчерпан бюджет ответа: {completion_tokens}/{MAX_OUTPUT_TOKENS} токенов")
+            return _parse_extraction(getattr(message, "content", None), kind)
+        except (ValueError, TypeError) as exc:
+            diagnostic = _save_bad_response(response, kind, index, str(exc))
+            print(f"  {kind} chunk {index}: {exc}; ответ сохранён: {diagnostic}", file=sys.stderr)
+            recoverable = reason in ("stop", "length") and not getattr(message, "refusal", None)
+            truncated = reason == "length" or budget_exhausted
+            if recoverable and not truncated and attempt == 0:
+                print(f"  {kind} chunk {index}: повторяем запрос JSON", file=sys.stderr)
+                continue
+            if recoverable:
+                if depth < MAX_SPLIT_DEPTH and len(chunk) >= MIN_SPLIT_CHARS:
+                    middle = len(chunk) // 2
+                    boundary = chunk.rfind("\n", len(chunk) // 4, middle)
+                    if boundary >= 0:
+                        middle = boundary + 1
+                    print(f"  {kind} chunk {index}: делим фрагмент пополам (уровень {depth + 1})",
+                          file=sys.stderr)
+                    parts = [_extract_json(part, index, kind, depth + 1)
+                             for part in (chunk[:middle], chunk[middle:])]
+                    return merge_ifrs_results(parts) if kind == "ifrs" else merge_results(parts)
+            raise RuntimeError(
+                f"Не удалось получить корректный JSON ({kind}, фрагмент {index}, "
+                f"finish_reason={reason}): {exc}. Диагностика: {diagnostic}"
+            ) from exc
 
 
 def extract_ifrs_chunk(chunk: str, index: int, total: int) -> dict:
     print(f"  IFRS chunk {index}/{total} ({len(chunk):,} chars)...", file=sys.stderr)
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        response_format={"type": "json_object"},
-        temperature=0,
-        messages=[
-            {"role": "system", "content": IFRS_PROMPT},
-            {"role": "user", "content": chunk},
-        ],
-        max_tokens=8192,
-    )
-    raw = response.choices[0].message.content
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        print(f"  Warning: could not parse IFRS JSON from chunk {index}", file=sys.stderr)
-        return {"statements": []}
+    return _extract_json(chunk, index, "ifrs")
 
 
 def merge_ifrs_results(results: list[dict]) -> dict:
@@ -140,33 +248,28 @@ def merge_ifrs_results(results: list[dict]) -> dict:
                 continue
             if stmt_type not in merged_by_type:
                 merged_by_type[stmt_type] = []
-            seen = {(i.get("section", ""), i.get("name", "")) for i in merged_by_type[stmt_type]}
+            seen = {(i.get("section", ""), i.get("name", "")): i
+                    for i in merged_by_type[stmt_type]}
             for item in stmt.get("items", []):
                 key = (item.get("section", ""), item.get("name", ""))
                 if key not in seen:
-                    merged_by_type[stmt_type].append(item)
-                    seen.add(key)
+                    copied = {**item, "periods": [dict(period) for period in item.get("periods", [])]}
+                    merged_by_type[stmt_type].append(copied)
+                    seen[key] = copied
+                else:
+                    periods = seen[key]["periods"]
+                    existing = {(p.get("period"), p.get("value")) for p in periods}
+                    for period in item.get("periods", []):
+                        pair = (period.get("period"), period.get("value"))
+                        if pair not in existing:
+                            periods.append(dict(period))
+                            existing.add(pair)
     return {"statements": [{"type": t, "items": items} for t, items in merged_by_type.items()]}
 
 
 def extract_chunk(chunk: str, index: int, total: int) -> dict:
     print(f"  Chunk {index}/{total} ({len(chunk):,} chars)...", file=sys.stderr)
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        response_format={"type": "json_object"},
-        temperature=0,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": chunk},
-        ],
-        max_tokens=4096,
-    )
-    raw = response.choices[0].message.content
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        print(f"  Warning: could not parse JSON from chunk {index}", file=sys.stderr)
-        return {"metrics": [], "risks": []}
+    return _extract_json(chunk, index, "metrics")
 
 
 def merge_results(results: list[dict]) -> dict:
@@ -199,13 +302,10 @@ def generate_conclusion(risks: list[dict]) -> str:
         for r in risks
     )
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model=get_model(),
         temperature=0,
-        messages=[
-            {"role": "system", "content": CONCLUSION_PROMPT},
-            {"role": "user", "content": risk_summary},
-        ],
-        max_tokens=512,
+        messages=build_messages(CONCLUSION_PROMPT, risk_summary),
+        **get_completion_options(),
     )
     return response.choices[0].message.content.strip()
 
@@ -343,9 +443,14 @@ def write_ifrs_sheet(wb, ifrs_data: dict) -> None:
     ws.freeze_panes = "B3"
 
 
-def write_excel(data: dict, out_path: str, conclusion: str = "", ifrs_data: dict | None = None) -> None:
+def write_excel(data: dict, out_path: str, conclusion: str = "", ifrs_data: dict | None = None,
+                company_profile: dict | None = None) -> None:
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
+
+    if company_profile:
+        from raexpert_context import write_company_sheets
+        write_company_sheets(wb, company_profile)
 
     # --- Metrics sheet ---
     ws = wb.create_sheet("Метрики")
@@ -448,7 +553,7 @@ def write_excel(data: dict, out_path: str, conclusion: str = "", ifrs_data: dict
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract key data from output.txt using GPT-4o")
+    parser = argparse.ArgumentParser(description="Extract key data from output.txt using the configured LLM")
     parser.add_argument("--input", default="output.txt", metavar="FILE", help="Input text file (default: output.txt)")
     parser.add_argument("--out", default="analysis.xlsx", metavar="FILE", help="Output Excel file (default: analysis.xlsx)")
     parser.add_argument("--workers", type=int, default=5, help="Parallel API workers (default: 5)")
@@ -463,7 +568,7 @@ def main():
     print(f"Read {len(text):,} chars from {input_path}", file=sys.stderr)
 
     chunks = build_chunks(text)
-    print(f"Split into {len(chunks)} chunk(s), sending to GPT-4o...", file=sys.stderr)
+    print(f"Split into {len(chunks)} chunk(s), sending to {get_model()}...", file=sys.stderr)
 
     results: list[dict] = [None] * len(chunks)
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
